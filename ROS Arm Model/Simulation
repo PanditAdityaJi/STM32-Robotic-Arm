@@ -1,0 +1,439 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from mpl_toolkits.mplot3d import Axes3D
+import math
+
+class RoboticArm:
+    def __init__(self):
+        # Define DH parameters [a, alpha, d, theta]
+        # For a 6-DOF arm based on typical configurations
+        self.dh_params = np.array([
+            [0, np.pi/2, 0.10, 0],        # Joint 1 (base rotation)
+            [0.15, 0, 0, 0],              # Joint 2 (shoulder)
+            [0.15, 0, 0, 0],              # Joint 3 (elbow)
+            [0, np.pi/2, 0, 0],           # Joint 4 (wrist rotation)
+            [0, -np.pi/2, 0.10, 0],       # Joint 5 (wrist pitch)
+            [0, 0, 0.05, 0]               # Joint 6 (wrist roll)
+        ])
+        
+        # Joint limits in radians
+        self.joint_limits = np.array([
+            [-np.pi, np.pi],           # Joint 1
+            [-np.pi/2, np.pi/2],       # Joint 2
+            [-np.pi/2, np.pi/2],       # Joint 3
+            [-np.pi, np.pi],           # Joint 4
+            [-np.pi/2, np.pi/2],       # Joint 5
+            [-np.pi, np.pi]            # Joint 6
+        ])
+        
+        # Current joint angles
+        self.joint_angles = np.zeros(6)
+        
+        # Define servo parameters
+        self.servo_speed = 60 * np.pi/180  # 60 degrees per second (in rad/s)
+        self.servo_resolution = 0.1 * np.pi/180  # 0.1 degree precision
+        
+        # STM32 control parameters
+        self.control_frequency = 50  # Hz (typical PWM frequency for servos)
+        self.dt = 1/self.control_frequency
+        
+    def limit_joint_angles(self, angles):
+        """Ensure joint angles are within limits"""
+        return np.clip(angles, self.joint_limits[:, 0], self.joint_limits[:, 1])
+    
+    def dh_transform(self, a, alpha, d, theta):
+        """Calculate homogeneous transformation matrix from DH parameters"""
+        ct = np.cos(theta)
+        st = np.sin(theta)
+        ca = np.cos(alpha)
+        sa = np.sin(alpha)
+        
+        return np.array([
+            [ct, -st*ca, st*sa, a*ct],
+            [st, ct*ca, -ct*sa, a*st],
+            [0, sa, ca, d],
+            [0, 0, 0, 1]
+        ])
+    
+    def forward_kinematics(self, joint_angles=None):
+        """Calculate forward kinematics using DH parameters"""
+        if joint_angles is None:
+            joint_angles = self.joint_angles
+            
+        # Create a list to store transformation matrices
+        T = np.identity(4)
+        transforms = [T]
+        
+        # Calculate transformation for each joint
+        for i in range(6):
+            # Get DH parameters for current joint
+            a, alpha, d, _ = self.dh_params[i]
+            theta = joint_angles[i]
+            
+            # Calculate transformation matrix
+            T_i = self.dh_transform(a, alpha, d, theta)
+            
+            # Accumulate transformation
+            T = T @ T_i
+            transforms.append(T.copy())
+            
+        return transforms
+    
+    def get_joint_positions(self, joint_angles=None):
+        """Get the positions of all joints"""
+        transforms = self.forward_kinematics(joint_angles)
+        
+        # Extract the position from each transformation matrix
+        positions = []
+        for T in transforms:
+            positions.append(T[:3, 3])
+            
+        return np.array(positions)
+    
+    def move_joints_to(self, target_angles, duration=1.0):
+        """Simulate moving joints to target angles over specified duration"""
+        target_angles = self.limit_joint_angles(target_angles)
+        
+        # Calculate number of steps based on control frequency
+        num_steps = int(duration * self.control_frequency)
+        
+        # Create time array
+        time_array = np.linspace(0, duration, num_steps)
+        
+        # Initialize array for joint angles over time
+        joint_trajectories = np.zeros((num_steps, 6))
+        
+        # Calculate joint angle trajectory
+        for i in range(num_steps):
+            t_ratio = i / (num_steps - 1) if num_steps > 1 else 1
+            joint_trajectories[i] = self.joint_angles + t_ratio * (target_angles - self.joint_angles)
+        
+        return time_array, joint_trajectories
+    
+    def simulate_servo_constraints(self, joint_trajectories):
+        """Apply realistic servo constraints to joint trajectories"""
+        constrained_trajectories = np.zeros_like(joint_trajectories)
+        constrained_trajectories[0] = joint_trajectories[0]
+        
+        for i in range(1, len(joint_trajectories)):
+            # Calculate maximum angle change per time step based on servo speed
+            max_delta = self.servo_speed * self.dt
+            
+            # Calculate actual angle change
+            delta = joint_trajectories[i] - constrained_trajectories[i-1]
+            
+            # Limit the change to servo capabilities
+            limited_delta = np.clip(delta, -max_delta, max_delta)
+            
+            # Round to servo resolution
+            constrained_angles = constrained_trajectories[i-1] + limited_delta
+            constrained_angles = np.round(constrained_angles / self.servo_resolution) * self.servo_resolution
+            
+            # Apply joint limits
+            constrained_trajectories[i] = self.limit_joint_angles(constrained_angles)
+            
+        return constrained_trajectories
+    
+    def update_current_angles(self, angles):
+        """Update the current joint angles"""
+        self.joint_angles = self.limit_joint_angles(angles)
+
+    def calculate_path(self, start_point, end_point, num_points=20):
+        """Calculate a linear path between two points in joint space"""
+        path = []
+        for i in range(num_points):
+            t = i / (num_points - 1)
+            path.append(start_point + t * (end_point - start_point))
+        return np.array(path)
+
+    def generate_demo_sequence(self):
+        """Generate a demonstration sequence of joint movements"""
+        # Define sequence of joint angles for demonstration
+        sequence = [
+            np.array([0, 0, 0, 0, 0, 0]),  # Home position
+            np.array([np.pi/4, np.pi/6, -np.pi/4, 0, np.pi/6, 0]),  # Position 1
+            np.array([-np.pi/4, np.pi/4, np.pi/4, np.pi/6, -np.pi/6, np.pi/4]),  # Position 2
+            np.array([0, -np.pi/6, -np.pi/3, -np.pi/4, 0, -np.pi/4]),  # Position 3
+            np.array([0, 0, 0, 0, 0, 0])   # Return to home position
+        ]
+        
+        all_times = []
+        all_trajectories = []
+        current_time = 0
+        
+        # Start from current position
+        current_angles = self.joint_angles.copy()
+        
+        # Generate trajectories between each pair of positions
+        for target_angles in sequence:
+            # Calculate time needed based on largest angle difference and servo speed
+            angle_diffs = np.abs(target_angles - current_angles)
+            move_time = np.max(angle_diffs) / self.servo_speed
+            move_time = max(move_time, 1.0)  # At least 1 second
+            
+            # Generate trajectory
+            times, traj = self.move_joints_to(target_angles, move_time)
+            
+            # Apply servo constraints
+            traj = self.simulate_servo_constraints(traj)
+            
+            # Adjust times to continue from last position
+            times = times + current_time
+            
+            # Add to overall trajectory
+            all_times.extend(times)
+            all_trajectories.extend(traj)
+            
+            # Update for next segment
+            current_time = times[-1]
+            current_angles = target_angles.copy()
+        
+        return np.array(all_times), np.array(all_trajectories)
+
+# Create visualizer for the robotic arm
+def visualize_arm(arm, joint_angles=None):
+    """Create a 3D visualization of the robotic arm"""
+    # Get joint positions
+    joint_positions = arm.get_joint_positions(joint_angles)
+    
+    # Create 3D plot
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Plot arm segments
+    ax.plot(joint_positions[:, 0], joint_positions[:, 1], joint_positions[:, 2], 'o-', linewidth=3, markersize=8)
+    
+    # Set axis limits
+    max_reach = np.sum([arm.dh_params[i][0] for i in range(6)]) + 0.2
+    ax.set_xlim([-max_reach, max_reach])
+    ax.set_ylim([-max_reach, max_reach])
+    ax.set_zlim([0, max_reach])
+    
+    # Labels
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_zlabel('Z (m)')
+    ax.set_title('STM32 6-DOF Robotic Arm Simulation')
+    
+    return fig, ax, joint_positions
+
+# Create a robotic arm instance
+arm = RoboticArm()
+
+# Generate demonstration sequence
+times, trajectories = arm.generate_demo_sequence()
+
+# Set up the figure for animation
+fig = plt.figure(figsize=(15, 10))
+
+# Create 3D plot for arm visualization
+ax1 = fig.add_subplot(2, 2, 1, projection='3d')
+max_reach = 0.5
+ax1.set_xlim([-max_reach, max_reach])
+ax1.set_ylim([-max_reach, max_reach])
+ax1.set_zlim([0, max_reach])
+ax1.set_xlabel('X (m)')
+ax1.set_ylabel('Y (m)')
+ax1.set_zlabel('Z (m)')
+ax1.set_title('STM32 6-DOF Robotic Arm Position')
+
+# Create plots for joint angles
+ax2 = fig.add_subplot(2, 2, 2)
+ax2.set_xlabel('Time (s)')
+ax2.set_ylabel('Joint Angle (rad)')
+ax2.set_title('Joint Angles over Time')
+
+# Create plot for end effector position
+ax3 = fig.add_subplot(2, 2, 3)
+ax3.set_xlabel('Time (s)')
+ax3.set_ylabel('Position (m)')
+ax3.set_title('End Effector Position')
+
+# Create plot for angular velocity
+ax4 = fig.add_subplot(2, 2, 4)
+ax4.set_xlabel('Time (s)')
+ax4.set_ylabel('Angular Velocity (rad/s)')
+ax4.set_title('Joint Angular Velocities')
+
+# Calculate and store end effector positions for all trajectories
+end_effector_positions = np.zeros((len(trajectories), 3))
+for i, angles in enumerate(trajectories):
+    positions = arm.get_joint_positions(angles)
+    end_effector_positions[i] = positions[-1]
+
+# Calculate joint angular velocities
+angular_velocities = np.zeros((len(trajectories)-1, 6))
+for i in range(len(trajectories)-1):
+    dt = times[i+1] - times[i]
+    if dt > 0:
+        angular_velocities[i] = (trajectories[i+1] - trajectories[i]) / dt
+
+# Initialize plots with empty data
+line_arm, = ax1.plot([], [], [], 'o-', linewidth=3, markersize=8)
+lines_angles = []
+for i in range(6):
+    line, = ax2.plot([], [], label=f'Joint {i+1}')
+    lines_angles.append(line)
+ax2.legend()
+
+lines_position = []
+for i, label in enumerate(['X', 'Y', 'Z']):
+    line, = ax3.plot([], [], label=label)
+    lines_position.append(line)
+ax3.legend()
+
+lines_velocity = []
+for i in range(6):
+    line, = ax4.plot([], [], label=f'Joint {i+1}')
+    lines_velocity.append(line)
+ax4.legend()
+
+# Function to initialize the animation
+def init():
+    line_arm.set_data([], [])
+    line_arm.set_3d_properties([])
+    
+    for line in lines_angles:
+        line.set_data([], [])
+    
+    for line in lines_position:
+        line.set_data([], [])
+    
+    for line in lines_velocity:
+        line.set_data([], [])
+    
+    return [line_arm] + lines_angles + lines_position + lines_velocity
+
+# Function to update the animation at each frame
+def update(frame):
+    # Update arm position
+    joint_angles = trajectories[frame]
+    joint_positions = arm.get_joint_positions(joint_angles)
+    
+    line_arm.set_data(joint_positions[:, 0], joint_positions[:, 1])
+    line_arm.set_3d_properties(joint_positions[:, 2])
+    
+    # Update joint angle plots
+    for i, line in enumerate(lines_angles):
+        line.set_data(times[:frame+1], trajectories[:frame+1, i])
+    
+    # Update end effector position plot
+    for i, line in enumerate(lines_position):
+        line.set_data(times[:frame+1], end_effector_positions[:frame+1, i])
+    
+    # Update angular velocity plot
+    if frame > 0:
+        for i, line in enumerate(lines_velocity):
+            line.set_data(times[1:frame+1], angular_velocities[:frame, i])
+    
+    return [line_arm] + lines_angles + lines_position + lines_velocity
+
+# Create animation
+ani = FuncAnimation(fig, update, frames=range(len(trajectories)), 
+                    init_func=init, blit=True, interval=100)
+
+# Adjust layout
+plt.tight_layout()
+
+# Display the animation
+plt.show()
+
+# Function to save results as a visual summary
+def save_simulation_results():
+    # Create a figure
+    fig = plt.figure(figsize=(15, 12))
+    
+    # Plot joint angles
+    ax1 = fig.add_subplot(3, 2, 1)
+    for i in range(6):
+        ax1.plot(times, trajectories[:, i], label=f'Joint {i+1}')
+    ax1.set_xlabel('Time (s)')
+    ax1.set_ylabel('Joint Angle (rad)')
+    ax1.set_title('Joint Angles')
+    ax1.legend()
+    
+    # Plot end effector position
+    ax2 = fig.add_subplot(3, 2, 2)
+    ax2.plot(times, end_effector_positions[:, 0], label='X')
+    ax2.plot(times, end_effector_positions[:, 1], label='Y')
+    ax2.plot(times, end_effector_positions[:, 2], label='Z')
+    ax2.set_xlabel('Time (s)')
+    ax2.set_ylabel('Position (m)')
+    ax2.set_title('End Effector Position')
+    ax2.legend()
+    
+    # Plot angular velocities
+    ax3 = fig.add_subplot(3, 2, 3)
+    times_vel = times[1:]
+    for i in range(6):
+        ax3.plot(times_vel, angular_velocities[:, i], label=f'Joint {i+1}')
+    ax3.set_xlabel('Time (s)')
+    ax3.set_ylabel('Angular Velocity (rad/s)')
+    ax3.set_title('Joint Angular Velocities')
+    ax3.legend()
+    
+    # Plot arm workspace (top view)
+    ax4 = fig.add_subplot(3, 2, 4)
+    ax4.plot(end_effector_positions[:, 0], end_effector_positions[:, 1], 'k-')
+    ax4.set_xlabel('X (m)')
+    ax4.set_ylabel('Y (m)')
+    ax4.set_title('End Effector Path (Top View)')
+    ax4.axis('equal')
+    
+    # Plot arm workspace (side view)
+    ax5 = fig.add_subplot(3, 2, 5)
+    ax5.plot(end_effector_positions[:, 0], end_effector_positions[:, 2], 'k-')
+    ax5.set_xlabel('X (m)')
+    ax5.set_ylabel('Z (m)')
+    ax5.set_title('End Effector Path (Side View)')
+    ax5.axis('equal')
+    
+    # Plot 3D trajectory
+    ax6 = fig.add_subplot(3, 2, 6, projection='3d')
+    ax6.plot(end_effector_positions[:, 0], end_effector_positions[:, 1], end_effector_positions[:, 2], 'b-')
+    
+    # Also plot final arm position
+    final_positions = arm.get_joint_positions(trajectories[-1])
+    ax6.plot(final_positions[:, 0], final_positions[:, 1], final_positions[:, 2], 'ro-')
+    
+    ax6.set_xlabel('X (m)')
+    ax6.set_ylabel('Y (m)')
+    ax6.set_zlabel('Z (m)')
+    ax6.set_title('End Effector 3D Trajectory')
+    
+    plt.tight_layout()
+    plt.savefig('robotic_arm_simulation_results.png', dpi=300)
+    plt.close()
+    
+    print("Simulation results saved as 'robotic_arm_simulation_results.png'")
+
+# Save simulation results
+save_simulation_results()
+
+# To test other movements:
+def test_specific_movement():
+    # Reset arm to home position
+    arm.update_current_angles(np.zeros(6))
+    
+    # Define start and end positions
+    start_angles = np.zeros(6)
+    end_angles = np.array([np.pi/3, np.pi/4, -np.pi/6, np.pi/2, -np.pi/4, np.pi/6])
+    
+    # Generate trajectory
+    duration = 3.0  # seconds
+    times, traj = arm.move_joints_to(end_angles, duration)
+    traj = arm.simulate_servo_constraints(traj)
+    
+    # Visualize
+    fig, ax, _ = visualize_arm(arm, traj[-1])
+    plt.title(f"Final Position After {duration}s Movement")
+    plt.savefig('specific_movement_test.png', dpi=300)
+    plt.close()
+    
+    print("Specific movement test saved as 'specific_movement_test.png'")
+
+# Test a specific movement
+test_specific_movement()
+
+print("Simulation complete")
