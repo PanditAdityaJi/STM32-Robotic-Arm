@@ -35,10 +35,12 @@ FreeRTOS
 
 Python
 
-### Control Modes:
+## Control Modes:
  Manual Mode: Use buttons or joystick to control the arm.
 
-## Automated Mode: Predefined movement sequences.
+## Automated Mode: 
+Predefined movement sequences.
 
-## Remote Control: Interface with a PC or mobile app via UART or Bluetooth.
+## Remote Control: 
+Interface with a PC or mobile app via UART or Bluetooth.
 
