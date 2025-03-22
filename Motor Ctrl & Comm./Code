@@ -1,0 +1,286 @@
+
+
+#include "main.h"
+#include "motor_control.h"
+#include <string.h>
+
+/* Servo motor positions (0-180 degrees) */
+uint16_t servo_positions[6] = {90, 90, 90, 90, 90, 90};
+uint16_t servo_min_pulse[6] = {500, 500, 500, 500, 500, 500};   // Min pulse width (μs)
+uint16_t servo_max_pulse[6] = {2500, 2500, 2500, 2500, 2500, 2500}; // Max pulse width (μs)
+
+/* Buffer for UART communication */
+uint8_t rx_buffer[64];
+uint8_t tx_buffer[64];
+
+/* -- COMMUNICATION INTERFACES -- */
+
+/* UART Initialization */
+static void UART_Init(void)
+{
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  
+  /* Enable UART receive interrupt */
+  HAL_UART_Receive_IT(&huart2, rx_buffer, 1);
+}
+
+/* I2C Initialization for MPU6050 IMU and PCA9685 PWM controller */
+static void I2C_Init(void)
+{
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* SPI Initialization for additional sensors or expansion */
+static void SPI_Init(void)
+{
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* -- MOTOR CONTROL -- */
+
+/* PWM Timer Initialization for Servo Control */
+static void TIM_PWM_Init(void)
+{
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  
+  /* Configure Timer 1 for PWM generation */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 84-1;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 20000-1;  // 20ms period (50Hz) for servo control
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  
+  /* Configure PWM channels for each servo */
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 1500;  // 1.5ms pulse (neutral position)
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  
+  /* Configure channels for up to 4 servos on TIM1 */
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  
+  /* Start PWM signals */
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+  
+  /* Configure Timer 2 for additional servos if needed */
+  // Similar configuration for TIM2...
+}
+
+/* Initialize servo motors to default positions */
+void ServoInit(void)
+{
+  for (int i = 0; i < 6; i++) {
+    SetServoPosition(i, servo_positions[i]);
+  }
+}
+
+/* Set servo position (angle in degrees: 0-180) */
+void SetServoPosition(uint8_t servo_id, uint16_t angle)
+{
+  if (servo_id >= 6 || angle > 180) {
+    return;  // Invalid parameters
+  }
+  
+  servo_positions[servo_id] = angle;
+  
+  /* Convert angle to pulse width (µs) */
+  uint16_t pulse = servo_min_pulse[servo_id] + 
+                   (angle * (servo_max_pulse[servo_id] - servo_min_pulse[servo_id])) / 180;
+  
+  /* Apply PWM value to appropriate timer channel */
+  switch (servo_id) {
+    case 0:
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pulse);
+      break;
+    case 1:
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pulse);
+      break;
+    case 2:
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pulse);
+      break;
+    case 3:
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, pulse);
+      break;
+    case 4:
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pulse);
+      break;
+    case 5:
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, pulse);
+      break;
+  }
+}
+
+/* Process commands received over UART */
+void ProcessCommand(uint8_t* cmd_buffer)
+{
+  /* Example command format: "S,0,90" (Set servo 0 to 90 degrees) */
+  char* token = strtok((char*)cmd_buffer, ",");
+  
+  if (token != NULL) {
+    if (strcmp(token, "S") == 0) {  /* Servo control command */
+      token = strtok(NULL, ",");
+      if (token != NULL) {
+        uint8_t servo_id = atoi(token);
+        token = strtok(NULL, ",");
+        if (token != NULL) {
+          uint16_t angle = atoi(token);
+          SetServoPosition(servo_id, angle);
+          
+          /* Send acknowledgment */
+          sprintf((char*)tx_buffer, "ACK,%d,%d\r\n", servo_id, angle);
+          HAL_UART_Transmit(&huart2, tx_buffer, strlen((char*)tx_buffer), 100);
+        }
+      }
+    }
+    /* Add other command types here */
+  }
+}
+
+/* UART RX Complete Callback */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2) {
+    static uint8_t rx_index = 0;
+    static uint8_t command_buffer[64];
+    
+    /* Check for end of command */
+    if (rx_buffer[0] == '\n' || rx_buffer[0] == '\r') {
+      command_buffer[rx_index] = '\0';
+      if (rx_index > 0) {
+        ProcessCommand(command_buffer);
+      }
+      rx_index = 0;
+    } else {
+      command_buffer[rx_index++] = rx_buffer[0];
+      
+      /* Prevent buffer overflow */
+      if (rx_index >= 63) {
+        rx_index = 0;
+      }
+    }
+    
+    /* Restart the interrupt receive */
+    HAL_UART_Receive_IT(&huart2, rx_buffer, 1);
+  }
+}
+
+/* Main control loop */
+void ControlLoop(void)
+{
+  /* Read IMU data */
+  MPU6050_Data_t imu_data;
+  MPU6050_Read_All(&hi2c1, &imu_data);
+  
+  /* Read limit switches if any */
+  // ReadLimitSwitches();
+  
+  /* Execute current control mode logic */
+  switch (current_control_mode) {
+    case MODE_MANUAL:
+      /* Manual control through UART commands */
+      break;
+      
+    case MODE_AUTOMATED:
+      /* Execute pre-programmed sequence */
+      ExecuteAutomatedSequence();
+      break;
+      
+    case MODE_REMOTE:
+      /* Remote control via higher-level commands */
+      break;
+  }
+  
+  /* Check for system errors */
+  // CheckSystemErrors();
+  
+  /* Small delay */
+  HAL_Delay(10);
+}
