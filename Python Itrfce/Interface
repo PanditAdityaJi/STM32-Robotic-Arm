@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+
+import sys
+import time
+import math
+import struct
+import threading
+import queue
+import numpy as np
+import serial
+import serial.tools.list_ports
+import tkinter as tk
+from tkinter import ttk, messagebox
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from mpl_toolkits.mplot3d import Axes3D
+
+# Constants
+NUM_JOINTS = 6
+BAUD_RATE = 115200
+TIMEOUT = 1.0
+
+# Protocol definitions
+CMD_SET_POSITION = 0x10
+CMD_SET_SPEED = 0x11
+CMD_HOME = 0x12
+CMD_STOP = 0x13
+CMD_GET_POSITION = 0x20
+CMD_GET_SENSOR_DATA = 0x21
+CMD_CALIBRATE = 0x30
+CMD_RUN_SEQUENCE = 0x40
+CMD_RUN_TRAJECTORY = 0x41
+
+# Message format
+# Header: 0xAA 0x55
+# Command: 1 byte
+# Length: 1 byte (length of data)
+# Data: Variable
+# Checksum: 1 byte (simple sum of all previous bytes)
+
+class RoboticArm:
+    """STM32 Robotic Arm Interface Class"""
+    
+    def __init__(self, port=None):
+        """Initialize the robotic arm interface
+        
+        Args:
+            port (str, optional): Serial port to connect to. If None, will attempt to autodetect.
+        """
+        self.port = port
+        self.serial = None
+        self.connected = False
+        self.lock = threading.Lock()
+        self.rx_queue = queue.Queue()
+        self.rx_thread = None
+        self.keep_running = False
+        
+        # Store the latest sensor data
+        self.joint_angles = [0.0] * NUM_JOINTS
+        self.joint_velocities = [0.0] * NUM_JOINTS
+        self.limit_switches = [False] * NUM_JOINTS
+        self.imu_data = {
+            'roll': 0.0,
+            'pitch': 0.0,
+            'yaw': 0.0,
+            'accel_x': 0,
+            'accel_y': 0,
+            'accel_z': 0,
+            'gyro_x': 0,
+            'gyro_y': 0,
+            'gyro_z': 0
+        }
+        
+        # Kinematics parameters (DH parameters)
+        # [a, alpha, d, theta_offset]
+        self.dh_params = [
+            [0, math.pi/2, 0.10, 0],         # Joint 1 (base rotation)
+            [0.15, 0, 0, 0],                 # Joint 2 (shoulder)
+            [0.15, 0, 0, 0],                 # Joint 3 (elbow)
+            [0, math.pi/2, 0, 0],            # Joint 4 (wrist rotation)
+            [0, -math.pi/2, 0.10, 0],        # Joint 5 (wrist pitch)
+            [0, 0, 0.05, 0]                  # Joint 6 (wrist roll)
+        ]
+        
+        # Joint limits in radians [min, max]
+        self.joint_limits = [
+            [-math.pi, math.pi],           # Joint 1
+            [-math.pi/2, math.pi/2],       # Joint 2
+            [-math.pi/2, math.pi/2],       # Joint 3
+            [-math.pi, math.pi],           # Joint 4
+            [-math.pi/2, math.pi/2],       # Joint 5
+            [-math.pi, math.pi]            # Joint 6
+        ]
+        
+    def autodetect_port(self):
+        """Attempt to automatically detect the STM32 serial port
+        
+        Returns:
+            str: Port name if found, None otherwise
+        """
+        ports = list(serial.tools.list_ports.comports())
+        for port in ports:
+            # Look for common STM32 descriptors
+            if 'STM32' in port.description or 'VCP' in port.description:
+                return port.device
+        
+        # Fallback to any port that might be our device
+        # In real app, you would use a more robust identification method
+        for port in ports:
+            try:
+                ser = serial.Serial(port.device, BAUD_RATE, timeout=0.5)
+                ser.close()
+                return port.device
+            except (serial.SerialException, OSError):
+                continue
+        
+        return None
+    
+    def connect(self, port=None):
+        """Connect to the robotic arm
+        
+        Args:
+            port (str, optional): Serial port to connect to. If None, will use stored port
+                                 or attempt to autodetect.
+                                 
+        Returns:
+            bool: True if connection successful, False otherwise
+        """
+        if port:
+            self.port = port
+        
+        if not self.port:
+            self.port = self.autodetect_port()
+            if not self.port:
+                print("Could not autodetect port. Please specify manually.")
+                return False
+        
+        try:
+            self.serial = serial.Serial(self.port, BAUD_RATE, timeout=TIMEOUT)
+            
+            # Flush buffers
+            self.serial.reset_input_buffer()
+            self.serial.reset_output_buffer()
+            
+            # Send a ping to check if device is responsive
+            if self.ping():
+                self.connected = True
+                
+                # Start the receive thread
+                self.keep_running = True
+                self.rx_thread = threading.Thread(target=self._rx_thread_func)
+                self.rx_thread.daemon = True
+                self.rx_thread.start()
+                
+                # Get initial position
+                self.get_position()
+                
+                return True
+            else:
+                self.serial.close()
+                self.serial = None
+                return False
+            
+        except serial.SerialException as e:
+            print(f"Error connecting: {e}")
+            self.serial = None
+            return False
+    
+    def disconnect(self):
+        """Disconnect from the robotic arm
+        
+        Returns:
+            bool: True if disconnection successful
+        """
+        if self.connected:
+            self.keep_running = False
+            if self.rx_thread:
+                self.rx_thread.join(timeout=1.0)
+            
+            if self.serial:
+                self.serial.close()
+                self.serial = None
+            
+            self.connected = False
+        
+        return True
+    
+    def ping(self):
+        """Ping the robotic arm to check if it's responsive
+        
+        Returns:
+            bool: True if ping successful
+        """
+        # Simple command with no data to check if device responds
+        response = self._send_command(0x01, [])
+        return response is not None
+    
+    def _send_command(self, command, data):
+        """Send a command to the robotic arm
+        
+        Args:
+            command (int): Command byte
+            data (list): List of data bytes
+            
+        Returns:
+            bytes: Response data if successful, None otherwise
+        """
+        if not self.connected or not self.serial:
+            return None
+        
+        # Build the message
+        length = len(data)
+        message = bytearray([0xAA, 0x55, command, length]) + bytearray(data)
+        
+        # Calculate checksum (simple sum of all previous bytes)
+        checksum = sum(message) & 0xFF
+        message.append(checksum)
+        
+        # Send the message
+        with self.lock:
+            try:
+                self.serial.write(message)
+                
+                # Wait for response in the queue
+                try:
+                    response = self.rx_queue.get(timeout=TIMEOUT)
+                    return response
+                except queue.Empty:
+                    print("Timeout waiting for response")
+                    return None
+                
+            except serial.SerialException as e:
+                print(f"Serial error: {e}")
+                self.connected = False
+                return None
+    
+    def _rx_thread_func(self):
+        """Background thread for receiving data from the arm"""
+        if not self.serial:
+            return
+        
+        # State machine for receiving
+        STATE_WAIT_HEADER1 = 0
+        STATE_WAIT_HEADER2 = 1
+        STATE_WAIT_COMMAND = 2
+        STATE_WAIT_LENGTH = 3
+        STATE_WAIT_DATA = 4
+        STATE_WAIT_CHECKSUM = 5
+        
+        state = STATE_WAIT_HEADER1
+        rx_buffer = bytearray()
+        rx_command = 0
+        rx_length = 0
+        
+        while self.keep_running:
+            try:
+                if self.serial.in_waiting > 0:
+                    byte = self.serial.read(1)
+                    
+                    if state == STATE_WAIT_HEADER1:
+                        if byte[0] == 0xAA:
+                            state = STATE_WAIT_HEADER2
+                    
+                    elif state == STATE_WAIT_HEADER2:
+                        if byte[0] == 0x55:
+                            state = STATE_WAIT_COMMAND
+                        else:
+                            state = STATE_WAIT_HEADER1
+                    
+                    elif state == STATE_WAIT_COMMAND:
+                        rx_command = byte[0]
+                        state = STATE_WAIT_LENGTH
+                    
+                    elif state == STATE_WAIT_LENGTH:
+                        rx_length = byte[0]
+                        if rx_length > 0:
+                            rx_buffer = bytearray()
+                            state = STATE_WAIT_DATA
+                        else:
+                            state = STATE_WAIT_CHECKSUM
+                    
+                    elif state == STATE_WAIT_DATA:
+                        rx_buffer.extend(byte)
+                        if len(rx_buffer) >= rx_length:
+                            state = STATE_WAIT_CHECKSUM
+                    
+                    elif state == STATE_WAIT_CHECKSUM:
+                        # Verify checksum
+                        expected_checksum = (0xAA + 0x55 + rx_command + rx_length + sum(rx_buffer)) & 0xFF
+                        if byte[0] == expected_checksum:
+                            # Valid message received
+                            
+                            # Parse and update sensor data if this is a sensor data message
+                            if rx_command == CMD_GET_SENSOR_DATA:
+                                self._parse_sensor_data(rx_buffer)
+                            
+                            # Add to queue for waiting command
+                            self.rx_queue.put(rx_buffer)
+                        
+                        # Reset state machine
+                        state = STATE_WAIT_HEADER1
+                
+                else:
+                    # No data available, sleep a bit to avoid busy waiting
+                    time.sleep(0.01)
+                    
+            except serial.SerialException as e:
+                print(f"Serial error in rx thread: {e}")
+                self.connected = False
+                break
+    
+    def _parse_sensor_data(self, data):
+        """Parse sensor data from received buffer
+        
+        Args:
+            data (bytes): Received data buffer
+        """
+        offset = 0
+        
+        # Parse IMU data (24 bytes)
+        if len(data) >= offset + 24:
+            self.imu_data['roll'] = struct.unpack_from('f', data, offset)[0]
+            offset += 4
+            self.imu_data['pitch'] = struct.unpack_from('f', data, offset)[0]
+            offset += 4
+            self.imu_data['yaw'] = struct.unpack_from('f', data, offset)[0]
+            offset += 4
+            self.imu_data['accel_x'] = struct.unpack_from('h', data, offset)[0]
+            offset += 2
+            self.imu_data['accel_y'] = struct.unpack_from('h', data, offset)[0]
+            offset += 2
+            self.imu_data['accel_z'] = struct.unpack_from('h', data, offset)[0]
+            offset += 2
+            self.imu_data['gyro_x'] = struct.unpack_from('h', data, offset)[0]
+            offset += 2
+            self.imu_data['gyro_y'] = struct.unpack_from('h', data, offset)[0]
+            offset += 2
+            self.imu_data['gyro_z'] = struct.unpack_from('h', data, offset)[0]
+            offset += 2
+        
+        # Parse encoder data (36 bytes for 6 joints)
+        for i in range(NUM_JOINTS):
+            if len(data) >= offset + 6:
+                position = struct.unpack_from('i', data, offset)[0]
+                offset += 4
+                velocity = struct.unpack_from('h', data, offset)[0]
+                offset += 2
+                
+                # Convert encoder ticks to radians
+                ticks_to_rad = (2.0 * math.pi) / (4096.0 * 20.0)  # Example for 12-bit encoder with 20:1 gear ratio
+                self.
