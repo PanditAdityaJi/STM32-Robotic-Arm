@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+# ROS2 Robotic Arm Structure Implementation
+
+import os
+from launch import LaunchDescription
+from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
+import xacro
+import yaml
+
+# URDF and Parameter File Generation
+def generate_launch_description():
+    # Package paths
+    pkg_name = 'stm32_robotic_arm'
+    pkg_path = get_package_share_directory(pkg_name)
+    
+    # URDF file paths
+    urdf_file = os.path.join(pkg_path, 'urdf', 'robotic_arm.urdf.xacro')
+    robot_description_config = xacro.process_file(urdf_file)
+    robot_description = {'robot_description': robot_description_config.toxml()}
+    
+    # Parameters
+    controller_params_file = os.path.join(pkg_path, 'config', 'arm_controllers.yaml')
+    with open(controller_params_file, 'r') as file:
+        controller_params = yaml.safe_load(file)
+    
+    # Robot State Publisher Node
+    robot_state_publisher_node = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        output='screen',
+        parameters=[robot_description]
+    )
+    
+    # Joint State Publisher Node
+    joint_state_publisher_node = Node(
+        package='joint_state_publisher',
+        executable='joint_state_publisher',
+        name='joint_state_publisher',
+        output='screen',
+    )
+    
+    # Controller Manager
+    controller_manager_node = Node(
+        package='controller_manager',
+        executable='ros2_control_node',
+        parameters=[robot_description, controller_params],
+        output='screen',
+    )
+    
+    # Joint Trajectory Controller
+    joint_trajectory_controller_spawner = Node(
+        package='controller_manager',
+        executable='spawner',
+        arguments=['joint_trajectory_controller', '-c', '/controller_manager'],
+    )
+    
+    # Joint State Broadcaster
+    joint_state_broadcaster_spawner = Node(
+        package='controller_manager',
+        executable='spawner',
+        arguments=['joint_state_broadcaster', '-c', '/controller_manager'],
+    )
+    
+    # STM32 Hardware Interface Node
+    stm32_interface_node = Node(
+        package='stm32_robotic_arm',
+        executable='stm32_hardware_interface',
+        output='screen',
+        parameters=[{
+            'serial_port': '/dev/ttyUSB0',
+            'baud_rate': 115200,
+            'servo_min_angles': [-90, -90, -90, -90, -90, -90],
+            'servo_max_angles': [90, 90, 90, 90, 90, 90],
+        }]
+    )
+    
+    # Visualization node (RViz)
+    rviz_config_file = os.path.join(pkg_path, 'config', 'arm_config.rviz')
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        arguments=['-d', rviz_config_file],
+        output='screen'
+    )
+    
+    return LaunchDescription([
+        robot_state_publisher_node,
+        joint_state_publisher_node,
+        controller_manager_node,
+        joint_trajectory_controller_spawner,
+        joint_state_broadcaster_spawner,
+        stm32_interface_node,
+        rviz_node
+    ])
