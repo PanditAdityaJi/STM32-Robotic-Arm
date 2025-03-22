@@ -1,0 +1,385 @@
+
+
+#include "stm32f4xx_hal.h"
+#include <stdint.h>
+#include <stdbool.h>
+#include <math.h>
+
+/* I2C handle for communication with sensors */
+I2C_HandleTypeDef hi2c1;
+
+/* Define MPU6050 registers and addresses */
+#define MPU6050_ADDR          0x68 << 1  // I2C address with R/W bit
+#define MPU6050_REG_ACCEL_X   0x3B
+#define MPU6050_REG_GYRO_X    0x43
+#define MPU6050_REG_PWR_MGMT  0x6B
+#define MPU6050_REG_CONFIG    0x1A
+#define MPU6050_REG_GYRO_CFG  0x1B
+#define MPU6050_REG_ACCEL_CFG 0x1C
+
+/* Define encoder GPIO pins */
+#define ENC1_A_PIN GPIO_PIN_0
+#define ENC1_B_PIN GPIO_PIN_1
+#define ENC1_PORT GPIOA
+
+/* Define limit switch GPIO pins */
+#define LIMIT_SW1_PIN GPIO_PIN_2
+#define LIMIT_SW1_PORT GPIOB
+#define LIMIT_SW2_PIN GPIO_PIN_3
+#define LIMIT_SW2_PORT GPIOB
+#define LIMIT_SW3_PIN GPIO_PIN_4
+#define LIMIT_SW3_PORT GPIOB
+
+/* Sensor data structures */
+typedef struct {
+    int16_t accel_x;
+    int16_t accel_y;
+    int16_t accel_z;
+    int16_t gyro_x;
+    int16_t gyro_y;
+    int16_t gyro_z;
+    float temp;
+    
+    // Calculated values
+    float roll;   // X-axis rotation
+    float pitch;  // Y-axis rotation
+    float yaw;    // Z-axis rotation
+} IMU_Data_t;
+
+typedef struct {
+    int32_t position;    // Current position in encoder ticks
+    int16_t velocity;    // Current velocity in ticks per second
+    bool direction;      // Current direction (true = forward)
+    uint32_t last_time;  // Last update time in milliseconds
+} Encoder_Data_t;
+
+/* Global sensor data */
+IMU_Data_t imu_data;
+Encoder_Data_t encoders[6];  // One for each joint
+bool limit_switches[6];      // State of each limit switch
+
+/**
+ * Initialize all sensors for the robotic arm
+ * @return HAL_OK if initialization is successful
+ */
+HAL_StatusTypeDef init_sensors(void) {
+    uint8_t check, data;
+    HAL_StatusTypeDef status;
+    
+    /* Initialize IMU (MPU6050) */
+    // Wake up the MPU6050
+    data = 0x00;
+    status = HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, MPU6050_REG_PWR_MGMT, 1, &data, 1, HAL_MAX_DELAY);
+    if (status != HAL_OK) return status;
+    
+    // Configure accelerometer: ±4g range
+    data = 0x08;
+    status = HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, MPU6050_REG_ACCEL_CFG, 1, &data, 1, HAL_MAX_DELAY);
+    if (status != HAL_OK) return status;
+    
+    // Configure gyroscope: ±500°/s range
+    data = 0x08;
+    status = HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, MPU6050_REG_GYRO_CFG, 1, &data, 1, HAL_MAX_DELAY);
+    if (status != HAL_OK) return status;
+    
+    // Set digital low-pass filter
+    data = 0x03;
+    status = HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, MPU6050_REG_CONFIG, 1, &data, 1, HAL_MAX_DELAY);
+    if (status != HAL_OK) return status;
+    
+    /* Initialize encoders */
+    for (int i = 0; i < 6; i++) {
+        encoders[i].position = 0;
+        encoders[i].velocity = 0;
+        encoders[i].direction = true;
+        encoders[i].last_time = HAL_GetTick();
+    }
+    
+    /* Initialize limit switches (pulled high, active low) */
+    for (int i = 0; i < 6; i++) {
+        limit_switches[i] = false;
+    }
+    
+    return HAL_OK;
+}
+
+/**
+ * Read data from the IMU sensor
+ * @return HAL_OK if read is successful
+ */
+HAL_StatusTypeDef read_imu(void) {
+    uint8_t data[14];
+    HAL_StatusTypeDef status;
+    
+    // Read 14 bytes of data starting from accel registers
+    status = HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, MPU6050_REG_ACCEL_X, 1, data, 14, HAL_MAX_DELAY);
+    if (status != HAL_OK) return status;
+    
+    // Convert raw data
+    imu_data.accel_x = (int16_t)(data[0] << 8 | data[1]);
+    imu_data.accel_y = (int16_t)(data[2] << 8 | data[3]);
+    imu_data.accel_z = (int16_t)(data[4] << 8 | data[5]);
+    imu_data.temp    = (int16_t)(data[6] << 8 | data[7]) / 340.0f + 36.53f; // Temperature conversion for MPU6050
+    imu_data.gyro_x  = (int16_t)(data[8] << 8 | data[9]);
+    imu_data.gyro_y  = (int16_t)(data[10] << 8 | data[11]);
+    imu_data.gyro_z  = (int16_t)(data[12] << 8 | data[13]);
+    
+    // Calculate roll and pitch from accelerometer (simple complementary filter)
+    // Note: This is a simplified approach. For better results, use a Kalman filter
+    // or Madgwick/Mahony filter to fuse accelerometer and gyroscope data
+    float accel_x_norm = imu_data.accel_x / 8192.0f; // For ±4g range
+    float accel_y_norm = imu_data.accel_y / 8192.0f;
+    float accel_z_norm = imu_data.accel_z / 8192.0f;
+    
+    // Calculate roll and pitch (in radians)
+    imu_data.roll = atan2f(accel_y_norm, accel_z_norm);
+    imu_data.pitch = atanf(-accel_x_norm / sqrtf(accel_y_norm * accel_y_norm + accel_z_norm * accel_z_norm));
+    
+    // For yaw, we need magnetometer data or integration of gyro
+    // This is a simplified approach using gyro integration
+    static float last_gyro_z = 0;
+    static uint32_t last_gyro_time = 0;
+    
+    uint32_t current_time = HAL_GetTick();
+    float dt = (current_time - last_gyro_time) / 1000.0f; // Convert to seconds
+    
+    if (last_gyro_time != 0 && dt > 0) {
+        // Simple integration of gyro data (will drift over time)
+        float gyro_z_norm = imu_data.gyro_z / 65.5f; // For ±500°/s range, convert to deg/s
+        gyro_z_norm = gyro_z_norm * (M_PI / 180.0f); // Convert to rad/s
+        imu_data.yaw += gyro_z_norm * dt;
+        
+        // Normalize yaw to -π to π
+        if (imu_data.yaw > M_PI) imu_data.yaw -= 2 * M_PI;
+        if (imu_data.yaw < -M_PI) imu_data.yaw += 2 * M_PI;
+    }
+    
+    last_gyro_time = current_time;
+    
+    return HAL_OK;
+}
+
+/**
+ * Encoder interrupt handler (example for one encoder)
+ * Should be called from GPIO ISR for encoder pins
+ */
+void encoder1_isr(void) {
+    // Read the current state of encoder pins
+    bool a_set = HAL_GPIO_ReadPin(ENC1_PORT, ENC1_A_PIN) == GPIO_PIN_SET;
+    bool b_set = HAL_GPIO_ReadPin(ENC1_PORT, ENC1_B_PIN) == GPIO_PIN_SET;
+    
+    // Determine direction based on the sequence of pulses
+    if (a_set != b_set) {
+        // Clockwise
+        encoders[0].position++;
+        encoders[0].direction = true;
+    } else {
+        // Counter-clockwise
+        encoders[0].position--;
+        encoders[0].direction = false;
+    }
+    
+    // Calculate velocity
+    uint32_t current_time = HAL_GetTick();
+    uint32_t dt = current_time - encoders[0].last_time;
+    
+    if (dt > 0) {
+        // Simple velocity calculation - can be improved with filtering
+        encoders[0].velocity = (encoders[0].direction ? 1 : -1) * (1000 / dt); // ticks per second
+        encoders[0].last_time = current_time;
+    }
+}
+
+/**
+ * Read the state of all limit switches
+ */
+void read_limit_switches(void) {
+    // Example for reading the first limit switch
+    limit_switches[0] = (HAL_GPIO_ReadPin(LIMIT_SW1_PORT, LIMIT_SW1_PIN) == GPIO_PIN_RESET);
+    limit_switches[1] = (HAL_GPIO_ReadPin(LIMIT_SW2_PORT, LIMIT_SW2_PIN) == GPIO_PIN_RESET);
+    limit_switches[2] = (HAL_GPIO_ReadPin(LIMIT_SW3_PORT, LIMIT_SW3_PIN) == GPIO_PIN_RESET);
+    // Continue for other limit switches...
+}
+
+/**
+ * Calibrate the robotic arm using limit switches and encoders
+ * This function moves each joint until it hits a limit switch, then sets
+ * that position as the reference (zero) position.
+ */
+void calibrate_arm(void) {
+    // Calibration routine for each joint
+    // Example for one joint:
+    
+    // 1. Move joint slowly in negative direction
+    // 2. Wait for limit switch to be triggered
+    // 3. Stop movement
+    // 4. Reset encoder position to 0
+    
+    // For demonstration purposes:
+    for (int i = 0; i < 6; i++) {
+        // Reset encoder position after hitting limit switch
+        encoders[i].position = 0;
+    }
+}
+
+/**
+ * Get the orientation of the end effector using the IMU
+ * @param roll Pointer to store roll angle in radians
+ * @param pitch Pointer to store pitch angle in radians
+ * @param yaw Pointer to store yaw angle in radians
+ */
+void get_end_effector_orientation(float *roll, float *pitch, float *yaw) {
+    // Make sure the IMU data is updated
+    read_imu();
+    
+    // Copy the calculated orientation
+    *roll = imu_data.roll;
+    *pitch = imu_data.pitch;
+    *yaw = imu_data.yaw;
+}
+
+/**
+ * Get the joint positions from encoders
+ * @param positions Array to store the 6 joint positions in radians
+ */
+void get_joint_positions(float positions[6]) {
+    // Convert encoder ticks to radians based on encoder resolution
+    // and gear ratios for each joint
+    
+    // Example conversion for 12-bit encoder (4096 ticks per revolution)
+    // with a 20:1 gear ratio
+    const float ticks_to_rad = (2.0f * M_PI) / (4096.0f * 20.0f);
+    
+    for (int i = 0; i < 6; i++) {
+        positions[i] = encoders[i].position * ticks_to_rad;
+    }
+}
+
+/**
+ * Detect collisions or abnormal resistance in the arm movement
+ * @return true if a collision is detected
+ */
+bool detect_collision(void) {
+    // Compare expected motor current or torque with actual values
+    // Implement current sensing or monitor encoder velocity vs. expected
+    
+    // Placeholder implementation:
+    for (int i = 0; i < 6; i++) {
+        // If joint is moving but velocity is much lower than expected,
+        // it might indicate a collision
+        if (encoders[i].velocity < EXPECTED_VELOCITY_THRESHOLD) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/**
+ * Pack sensor data for transmission to PC interface
+ * @param buffer Buffer to store the packed data
+ * @param size Size of the buffer in bytes
+ * @return Number of bytes written to the buffer
+ */
+uint32_t pack_sensor_data(uint8_t *buffer, uint32_t size) {
+    uint32_t offset = 0;
+    
+    // Pack IMU data
+    if (offset + 24 <= size) {
+        memcpy(buffer + offset, &imu_data.roll, 4);
+        offset += 4;
+        memcpy(buffer + offset, &imu_data.pitch, 4);
+        offset += 4;
+        memcpy(buffer + offset, &imu_data.yaw, 4);
+        offset += 4;
+        memcpy(buffer + offset, &imu_data.accel_x, 2);
+        offset += 2;
+        memcpy(buffer + offset, &imu_data.accel_y, 2);
+        offset += 2;
+        memcpy(buffer + offset, &imu_data.accel_z, 2);
+        offset += 2;
+        memcpy(buffer + offset, &imu_data.gyro_x, 2);
+        offset += 2;
+        memcpy(buffer + offset, &imu_data.gyro_y, 2);
+        offset += 2;
+        memcpy(buffer + offset, &imu_data.gyro_z, 2);
+        offset += 2;
+    }
+    
+    // Pack encoder data
+    for (int i = 0; i < 6; i++) {
+        if (offset + 6 <= size) {
+            memcpy(buffer + offset, &encoders[i].position, 4);
+            offset += 4;
+            memcpy(buffer + offset, &encoders[i].velocity, 2);
+            offset += 2;
+        }
+    }
+    
+    // Pack limit switch data (1 byte total for 6 switches)
+    if (offset + 1 <= size) {
+        uint8_t switch_byte = 0;
+        for (int i = 0; i < 6; i++) {
+            if (limit_switches[i]) {
+                switch_byte |= (1 << i);
+            }
+        }
+        buffer[offset++] = switch_byte;
+    }
+    
+    return offset;
+}
+
+/**
+ * Process sensor data for control algorithm
+ * @param joint_angles Current joint angles in radians
+ * @param target_angles Target joint angles in radians
+ * @param output PWM values for motor control (0-1000)
+ */
+void process_sensor_data_for_control(float joint_angles[6], float target_angles[6], uint16_t output[6]) {
+    // Read latest sensor data
+    read_imu();
+    read_limit_switches();
+    
+    // Get current joint positions
+    get_joint_positions(joint_angles);
+    
+    // PID control example for joint angles
+    const float Kp = 5.0f;   // Proportional gain
+    const float Ki = 0.1f;   // Integral gain
+    const float Kd = 0.5f;   // Derivative gain
+    
+    static float integral[6] = {0};
+    static float prev_error[6] = {0};
+    
+    for (int i = 0; i < 6; i++) {
+        // Skip if limit switch is triggered
+        if (limit_switches[i]) {
+            output[i] = 0;  // Stop motor
+            integral[i] = 0; // Reset integral
+            continue;
+        }
+        
+        // Calculate error
+        float error = target_angles[i] - joint_angles[i];
+        
+        // Update integral with anti-windup
+        integral[i] += error;
+        if (integral[i] > 100) integral[i] = 100;
+        if (integral[i] < -100) integral[i] = -100;
+        
+        // Calculate derivative
+        float derivative = error - prev_error[i];
+        prev_error[i] = error;
+        
+        // PID formula
+        float control = Kp * error + Ki * integral[i] + Kd * derivative;
+        
+        // Convert to PWM value (0-1000)
+        float pwm = 500 + control * 50;  // 500 is center (no movement)
+        if (pwm > 1000) pwm = 1000;
+        if (pwm < 0) pwm = 0;
+        
+        output[i] = (uint16_t)pwm;
+    }
+}
